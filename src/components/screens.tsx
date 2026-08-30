@@ -1,6 +1,7 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { KEYART, INTRO_LINES, ENDING_LINES, CONTROLS, fmtTime } from "../game/data";
 import type { RunStats } from "../game/engine";
+import type { NetStatus } from "../game/net";
 import type { PerkDef } from "../game/data";
 
 const Icon = ({ d, color, size = 30 }: { d: string; color: string; size?: number }) => (
@@ -351,6 +352,178 @@ export function VictoryScreen({ stats, onRetry, onMenu }: { stats: RunStats; onR
             </div>
           </div>
         )}
+      </div>
+      <div className="scanlines" />
+    </div>
+  );
+}
+
+/* ============================ MULTIPLAYER LOBBY ============================ */
+
+const STATUS_META: Record<NetStatus, { text: string; color: string }> = {
+  idle: { text: "КАНАЛ СВОБОДЕН", color: "#6a5f8f" },
+  connecting: { text: "РЕГИСТРАЦИЯ НА СЕРВЕРЕ…", color: "#fcee0a" },
+  hosting: { text: "КОМНАТА ОТКРЫТА // ОЖИДАНИЕ ОТРЯДА", color: "#00e5ff" },
+  joining: { text: "ПОДКЛЮЧЕНИЕ…", color: "#fcee0a" },
+  connected: { text: "НЕЙРОЛИНК СТАБИЛЕН", color: "#39ff9d" },
+  error: { text: "СБОЙ", color: "#ff3b4e" },
+  closed: { text: "КАНАЛ ЗАКРЫТ", color: "#ff9a3d" },
+};
+
+export function MultiplayerLobby({ status, info, role, roomCode, ping, players, myName, onHost, onJoin, onStartHost, onBack }: {
+  status: NetStatus; info?: string; role: "host" | "guest" | null; roomCode: string; ping: number;
+  players: string[]; myName: string;
+  onHost: () => void; onJoin: (code: string) => void; onStartHost: () => void; onBack: () => void;
+}) {
+  const [tab, setTab] = useState<"host" | "join">("host");
+  const [code, setCode] = useState("");
+  const [copied, setCopied] = useState(false);
+  const meta = STATUS_META[status];
+  const showError = status === "error" || status === "closed";
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(roomCode);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1400);
+    } catch { setCopied(false); }
+  };
+
+  return (
+    <div className="absolute inset-0 overflow-hidden">
+      <div className="absolute inset-0 bg-cover bg-center" style={{ backgroundImage: `url(${KEYART})` }} />
+      <div className="absolute inset-0" style={{ background: "linear-gradient(90deg, rgba(7,3,15,0.96) 0%, rgba(7,3,15,0.88) 55%, rgba(10,4,22,0.7) 100%)" }} />
+      <div className="bg-gridfloor" />
+
+      <div className="relative z-10 h-full flex items-center justify-center p-6">
+        <div className="w-[980px] max-w-[96vw] grid grid-cols-1 lg:grid-cols-[1.25fr_1fr] gap-5 slide-up">
+          {/* left: terminal */}
+          <div className="panel panel-y p-7">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="font-disp text-[12px] font-bold tracking-[0.4em] text-[#00e5ff]">НЕЙРО-СВЯЗЬ // WEBRTC P2P</div>
+                <div className="font-disp text-4xl font-black text-white mt-1">МУЛЬТИПЛЕЕР</div>
+              </div>
+              <div className="flex items-center gap-2 text-[11px] font-bold tracking-[0.2em]" style={{ color: meta.color }}>
+                <span className={`w-2 h-2 rounded-full ${status === "hosting" || status === "connected" ? "blink" : ""}`} style={{ background: meta.color }} />
+                {meta.text}
+              </div>
+            </div>
+            {info && <div className="mt-1 text-[12px] font-semibold text-[#6a5f8f]">{info}</div>}
+            {showError && info && <div className="mt-2 text-[13px] font-bold text-[#ff3b4e]">{info}</div>}
+
+            {/* tabs */}
+            <div className="mt-6 flex gap-2">
+              {(["host", "join"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTab(t)}
+                  className={`btn px-5 py-2.5 text-[12px] ${tab === t ? "btn-y" : "btn-ghost"}`}
+                >
+                  {t === "host" ? "СОЗДАТЬ КОМНАТУ" : "ПРИСОЕДИНИТЬСЯ"}
+                </button>
+              ))}
+            </div>
+
+            {tab === "host" && (
+              <div className="mt-6">
+                <div className="text-[12px] font-semibold tracking-[0.2em] text-[#6a5f8f]">КОД КОМНАТЫ — ПЕРЕДАЙТЕ НАПАРНИКУ</div>
+                <div className="mt-2 flex items-center gap-3">
+                  <div className="font-disp text-[52px] font-black tracking-[0.35em] text-[#fcee0a] pulse-glow leading-none">
+                    {role === "host" ? roomCode : "————"}
+                  </div>
+                  {role === "host" && (
+                    <button className="btn btn-ghost px-3 py-2 text-[11px]" onClick={copy}>{copied ? "СКОПИРОВАНО" : "КОПИРОВАТЬ"}</button>
+                  )}
+                </div>
+
+                <div className="mt-5">
+                  <div className="text-[12px] font-semibold tracking-[0.2em] text-[#6a5f8f]">ОТРЯД [{players.length + (role === "host" ? 1 : 0)}/4]</div>
+                  <div className="mt-2 space-y-1.5">
+                    <div className="flex items-center justify-between panel px-3 py-2">
+                      <span className="font-disp text-[13px] font-bold text-[#fcee0a]">ВИ</span>
+                      <span className="text-[11px] font-bold tracking-widest text-[#39ff9d]">ХОСТ // ВЫ</span>
+                    </div>
+                    {players.map((p, i) => (
+                      <div key={p + i} className="flex items-center justify-between panel px-3 py-2 toast-in">
+                        <span className="font-disp text-[13px] font-bold text-[#00e5ff]">{p}</span>
+                        <span className="text-[11px] font-bold tracking-widest text-[#6a5f8f]">ГОТОВ{ping > 0 ? ` // ${ping}МС` : ""}</span>
+                      </div>
+                    ))}
+                    {players.length === 0 && (
+                      <div className="text-[12px] text-[#443c63] font-semibold px-1 pt-1 blink">ОЖИДАНИЕ ПОДКЛЮЧЕНИЯ…</div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="mt-6 flex items-center gap-3">
+                  <button className="btn btn-y px-8 py-3 text-[14px]" onClick={onStartHost} disabled={role !== "host"}>
+                    ▸ {players.length > 0 ? "НАЧАТЬ ЗАЕЗД" : "СТАРТОВАТЬ"}
+                  </button>
+                  <button className="btn btn-ghost px-5 py-3 text-[12px]" onClick={onBack}>◂ НАЗАД</button>
+                </div>
+              </div>
+            )}
+
+            {tab === "join" && (
+              <div className="mt-6">
+                <div className="text-[12px] font-semibold tracking-[0.2em] text-[#6a5f8f]">ВВЕДИТЕ КОД КОМНАТЫ ХОСТА</div>
+                <div className="mt-2 flex items-center gap-3">
+                  <input
+                    value={code}
+                    onChange={(e) => setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6))}
+                    onKeyDown={(e) => { if (e.key === "Enter" && code.length === 6) onJoin(code); }}
+                    placeholder="······"
+                    className="font-disp text-[40px] font-black tracking-[0.4em] text-[#00e5ff] bg-[#120a22] border border-[#00e5ff]/40 px-5 py-1 outline-none w-[340px] text-center placeholder-[#2a2148] focus:border-[#00e5ff]"
+                    style={{ clipPath: "polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px)" }}
+                  />
+                </div>
+                <div className="mt-6 flex items-center gap-3">
+                  <button className="btn btn-y px-8 py-3 text-[14px]" onClick={() => onJoin(code)} disabled={code.length !== 6 || status === "joining"}>
+                    ▸ ПОДКЛЮЧИТЬСЯ
+                  </button>
+                  <button className="btn btn-ghost px-5 py-3 text-[12px]" onClick={onBack}>◂ НАЗАД</button>
+                </div>
+                {status === "connected" && (
+                  <div className="mt-4 text-[14px] font-bold text-[#39ff9d]">ВЫ — {myName} // ЗАПУСК…</div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* right: briefing */}
+          <div className="panel p-7 h-fit">
+            <div className="font-disp text-[13px] font-bold tracking-[0.3em] text-[#ff2d78]">БРИФИНГ // КО-ОП</div>
+            <div className="mt-4 space-y-3 text-[13.5px] leading-snug font-medium text-[#c9c2e6]">
+              <div className="flex gap-3">
+                <span className="font-disp text-[#fcee0a] font-black text-lg leading-none mt-0.5">01</span>
+                <p>Один игрок создаёт комнату и играет за <span className="text-[#fcee0a] font-bold">Ви</span> — хост ведёт симуляцию мира, волн и «Базилиска».</p>
+              </div>
+              <div className="flex gap-3">
+                <span className="font-disp text-[#00e5ff] font-black text-lg leading-none mt-0.5">02</span>
+                <p>Второй вводит 6-значный код и играет за <span className="text-[#00e5ff] font-bold">Панам</span> — соединение прямое, <span className="text-white">WebRTC (PeerJS)</span>, без игровых серверов.</p>
+              </div>
+              <div className="flex gap-3">
+                <span className="font-disp text-[#39ff9d] font-black text-lg leading-none mt-0.5">03</span>
+                <p>Вместе отбивайте волны корпо, делите опыт, прокачивайте импланты и доведите танк до маяка. Врагов больше — слава тоже.</p>
+              </div>
+            </div>
+            <div className="mt-5 panel px-3 py-2.5">
+              <div className="text-[10px] font-bold tracking-[0.24em] text-[#ff9a3d]">ТЕХНИЧЕСКАЯ СВОДКА</div>
+              <div className="mt-1.5 grid grid-cols-2 gap-x-4 gap-y-1 text-[12px] font-semibold text-[#6a5f8f]">
+                <span>Сигнализация: PeerJS Cloud</span>
+                <span>Данные: DataChannel</span>
+                <span>Снэпшоты: 10 Гц</span>
+                <span>Инпут: 15 Гц</span>
+                <span>Пинг: {ping > 0 ? `${ping} мс` : "—"}</span>
+                <span>NAT: STUN-обход</span>
+              </div>
+            </div>
+            <div className="mt-4 text-[11px] font-semibold text-[#443c63] leading-relaxed">
+              Нужен интернет и открытый WebRTC. Если напарник за строгим NAT — обмен может не состояться; попробуйте другую сеть.
+            </div>
+          </div>
+        </div>
       </div>
       <div className="scanlines" />
     </div>
