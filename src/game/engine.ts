@@ -20,6 +20,10 @@ export interface HudData {
   sandeActive: boolean; sandeFrac: number; dashFrac: number;
   spread: number; aiming: boolean; implants: string[]; yaw: number;
   radar: { x: number; z: number; k: string }[];
+  net: {
+    role: "host" | "guest" | null; ping: number; room: string; gdead: boolean; respawnIn: number;
+    squad: { name: string; hp: number; maxHp: number; me: boolean; dead: boolean }[];
+  };
 }
 export interface RunStats { kills: number; level: number; timeSec: number; accuracy: number; dmgDealt: number; wave: number }
 export type GameEv =
@@ -49,12 +53,24 @@ interface Enemy {
   bar: THREE.Sprite; barTex: THREE.CanvasTexture; barCtx: CanvasRenderingContext2D;
   mats: THREE.MeshStandardMaterial[]; rotors?: THREE.Group;
 }
-interface Bolt { mesh: THREE.Mesh; vel: THREE.Vector3; dmg: number; life: number }
+interface Bolt { mesh: THREE.Mesh; vel: THREE.Vector3; dmg: number; life: number; visual?: boolean; pid?: string | null }
 interface Particle { mesh: THREE.Mesh; vel: THREE.Vector3; life: number; max: number }
 interface Tracer { mesh: THREE.Mesh; life: number; max: number }
-interface Pickup { group: THREE.Group; kind: "med" | "chip"; t: number }
+interface Pickup { group: THREE.Group; kind: "med" | "chip"; t: number; id: number }
+
+interface SquadMember {
+  pid: string; name: string; hp: number; maxHp: number; dead: boolean;
+  x: number; y: number; z: number; yaw: number; w: number; f: boolean; last: number;
+}
+interface RemotePlayer {
+  pid: string; name: string; group: THREE.Group; accent: THREE.MeshStandardMaterial;
+  muzzle: THREE.PointLight; tx: number; ty: number; tz: number; trot: number; dead: boolean;
+}
 
 let EID = 1;
+let PICKUP_ID = 1;
+export const GUEST_NAMES = ["ПАНАМ", "ДЖЕККИ", "ДЖУДИ"];
+export const AVATAR_COLORS = [0xff9a3d, 0xff2d78, 0x00e5ff];
 
 /* ============================== helpers ============================== */
 
@@ -249,6 +265,21 @@ export class GameEngine {
 
   /* temps */
   private tmpV = new THREE.Vector3(); private tmpV2 = new THREE.Vector3();
+
+  /* ---------- net (co-op) ---------- */
+  netMode: null | "host" | "guest" = null;
+  roomCode = "";
+  netPing = 0;
+  guestDead = false;
+  private netSendFn: ((to: string | null, m: unknown) => void) | null = null;
+  private netTick = 0; private netStateTick = 0;
+  private squad = new Map<string, SquadMember>();
+  private remotePlayers = new Map<string, RemotePlayer>();
+  private netTargets = new Map<number, { x: number; z: number; rot: number; hp: number; max: number; fuse: number }>();
+  private netBkZ = 0; private netBkHp = 1000; private netPk = new Map<number, Pickup>();
+  private respawnWait = 0; private reqSent = false;
+  private guestName = "ПАНАМ";
+  private avInfo = new Map<string, { name: string; hp: number; dead: boolean }>();
 
   constructor(canvas: HTMLCanvasElement, cb: EngineCallbacks) {
     this.canvas = canvas;
@@ -584,7 +615,13 @@ export class GameEngine {
     this.mode = "play";
     this.sfx.ensure();
     this.sfx.startMusic();
-    this.cb.onEvent({ t: "banner", text: "ЭСКАП-ПРОТОКОЛ", sub: "Доведи «Базилиск» до маяка" });
+    if (this.netMode === "guest") {
+      this.cb.onEvent({ t: "banner", text: "СВЯЗЬ УСТАНОВЛЕНА", sub: `Ты — ${this.guestName}. Прикрывай Ви и «Базилиск»` });
+    } else if (this.netMode === "host") {
+      this.cb.onEvent({ t: "banner", text: "РЕЖИМ СО-ОП", sub: "Отряд в сети — доведите «Базилиск» до маяка" });
+    } else {
+      this.cb.onEvent({ t: "banner", text: "ЭСКАП-ПРОТОКОЛ", sub: "Доведи «Базилиск» до маяка" });
+    }
     this.requestLock();
   }
 
@@ -620,6 +657,11 @@ export class GameEngine {
 
     this.runT = 0; this.kills = 0; this.shots = 0; this.hitsC = 0; this.dmgDealt = 0;
     this.wave = 0; this.waveT = 3; this.timeScale = 1; this.radioIdx = 0;
+    this.guestDead = false; this.respawnWait = 0; this.reqSent = false;
+    this.netTargets.clear();
+    this.netPk.forEach((pk) => this.scene.remove(pk.group));
+    this.netPk.clear();
+    this.netBkZ = 0; this.netBkHp = this.basiliskMax;
     this.basilisk.position.set(0, 0, 0);
     this.basilisk.visible = true;
     this.basiliskHp = this.basiliskMax; this.basiliskDead = false;
@@ -668,6 +710,401 @@ export class GameEngine {
   }
 
   setMuted(m: boolean) { this.sfx.setMuted(m); }
+
+  /* ================= NET (co-op WebRTC) ================= */
+
+  attachNet(send: (to: string | null, m: unknown) => void, role: "host" | "guest", room: string) {
+    this.netSendFn = send;
+    this.netMode = role;
+    this.roomCode = room;
+    this.netBkZ = 0;
+  }
+  netSquadNames(): string[] {
+    return Array.from(this.squad.values()).map((m) => m.name);
+  }
+  detachNet() { this.netSendFn = null; this.netMode = null; this.roomCode = ""; }
+  toAttract() {
+    this.detachNet();
+    this.reset();
+    this.mode = "attract";
+  }
+
+  private r1 = (v: number) => Math.round(v * 10) / 10;
+
+  private netToast(text: string, tone: "panam" | "sys" | "chip" | "warn" = "sys") {
+    this.cb.onEvent({ t: "toast", text, tone });
+    if (this.netMode === "host" && this.netSendFn) this.netSendFn(null, { t: "toast", text, tone });
+  }
+  private netBanner(text: string, sub?: string) {
+    this.cb.onEvent({ t: "banner", text, sub });
+    if (this.netMode === "host" && this.netSendFn) this.netSendFn(null, { t: "banner", text, sub });
+  }
+
+  /* ----- host side ----- */
+
+  netGuestJoined(pid: string) {
+    const name = GUEST_NAMES[this.squad.size % GUEST_NAMES.length];
+    const color = AVATAR_COLORS[this.squad.size % AVATAR_COLORS.length];
+    this.squad.set(pid, { pid, name, hp: 100, maxHp: 100, dead: false, x: this.pos.x + 2, y: 0, z: this.pos.z - 2, yaw: 0, w: 0, f: false, last: performance.now() });
+    this.ensureRemote(pid, name, color);
+    this.netSendFn?.(pid, { t: "welcome", name, room: this.roomCode });
+    this.netToast(`${name} в сети // отряд +1`, "sys");
+    this.sendSnapshot();
+  }
+  netGuestLeft(pid: string) {
+    const m = this.squad.get(pid);
+    if (!m) return;
+    this.squad.delete(pid);
+    const rp = this.remotePlayers.get(pid);
+    if (rp) { this.scene.remove(rp.group); this.remotePlayers.delete(pid); }
+    this.netToast(`${m.name}: связь потеряна`, "warn");
+  }
+  private hostGuestState(from: string, m: { p: number[]; yaw: number; hp: number; w: number; f: boolean }) {
+    const s = this.squad.get(from);
+    if (!s) return;
+    s.last = performance.now();
+    s.x = m.p[0]; s.y = m.p[1]; s.z = m.p[2];
+    s.yaw = m.yaw; s.hp = m.hp; s.w = m.w; s.f = m.f;
+    if (s.hp <= 0 && !s.dead) { s.dead = true; this.netSendFn?.(from, { t: "die" }); }
+    if (s.hp > 0 && s.dead) s.dead = false;
+    const rp = this.remotePlayers.get(from);
+    if (rp) { rp.tx = s.x; rp.tz = s.z; rp.trot = s.yaw; rp.dead = s.dead; if (s.f) rp.muzzle.intensity = 3.2; }
+  }
+  private hostGuestShot(from: string, m: { o: number[]; d: number[]; w: number; mult: number; crit: number }) {
+    const w = WEAPONS[m.w];
+    if (!w) return;
+    const origin = new THREE.Vector3(m.o[0], m.o[1], m.o[2]);
+    const base = new THREE.Vector3(m.d[0], m.d[1], m.d[2]).normalize();
+    for (let p = 0; p < w.pellets; p++) {
+      const dir = base.clone().add(new THREE.Vector3(rnd(-1, 1), rnd(-1, 1), rnd(-1, 1)).multiplyScalar(w.spread * 1.25)).normalize();
+      this.ray.set(origin, dir);
+      this.ray.far = 160;
+      const hits = this.ray.intersectObjects(this.enemyRoots, true);
+      if (!hits.length) continue;
+      const h = hits[0];
+      const en = this.enemyById.get((h.object.userData.eid as number) ?? -1);
+      if (!en || en.dead) continue;
+      const falloff = w.kind === "shotgun" ? clamp(1.4 - h.distance / 42, 0.35, 1.15) : clamp(1.25 - h.distance / 110, 0.55, 1.1);
+      let dmg = w.dmg * m.mult * falloff;
+      const crit = Math.random() < m.crit;
+      if (crit) dmg *= 2;
+      this.spawnSparks(h.point, 0xffb35a, 3, 4);
+      this.damageEnemy(en, dmg, h.point, crit, from);
+      this.netSendFn?.(from, { t: "float", at: [this.r1(h.point.x), this.r1(h.point.y), this.r1(h.point.z)], txt: String(Math.round(dmg)), crit });
+    }
+  }
+  private hostGuestDash(from: string, m: { p: number[]; mdmg: number }) {
+    const p = new THREE.Vector3(m.p[0], m.p[1], m.p[2]);
+    this.spawnSparks(p.clone().add(new THREE.Vector3(0, 1, 0)), 0x00e5ff, 10, 4);
+    if (m.mdmg > 0) {
+      [...this.enemies].forEach((e) => {
+        if (e.root.position.distanceTo(p) < 4.2) this.damageEnemy(e, m.mdmg, e.root.position.clone().add(new THREE.Vector3(0, 1.4, 0)), false, from);
+      });
+    }
+  }
+  private hostPick(from: string, id: number) {
+    const pk = this.pickups.find((x) => x.id === id);
+    if (!pk) return;
+    this.scene.remove(pk.group);
+    this.pickups = this.pickups.filter((x) => x.id !== id);
+    this.squad.forEach((_m, pid) => { if (pid !== from) this.netSendFn?.(pid, { t: "pick", id }); });
+  }
+
+  private nearestPlayer(ep: THREE.Vector3): { pos: THREE.Vector3; pid: string | null; d: number } {
+    let best: { pos: THREE.Vector3; pid: string | null; d: number } = { pos: this.pos, pid: null, d: ep.distanceTo(this.pos) };
+    this.squad.forEach((m) => {
+      if (m.dead) return;
+      const p = new THREE.Vector3(m.x, m.y, m.z);
+      const d = ep.distanceTo(p);
+      if (d < best.d) best = { pos: p, pid: m.pid, d };
+    });
+    return best;
+  }
+
+  private sendSnapshot() {
+    if (!this.netSendFn) return;
+    const e = this.enemies.map((en) => [
+      en.eid, en.kind, this.r1(en.root.position.x), this.r1(en.root.position.y), this.r1(en.root.position.z),
+      this.r1(en.root.rotation.y), Math.round(en.hp), Math.round(en.maxHp), en.fuse > 0 ? 1 : 0,
+    ]);
+    const av: (string | number | boolean)[][] = [[
+      "H", "ВИ", this.r1(this.pos.x), 0, this.r1(this.pos.z), this.r1(this.yaw),
+      Math.round(this.hp), this.weaponIdx, this.mouseDown, false,
+    ]];
+    this.squad.forEach((m) => {
+      av.push([m.pid, m.name, this.r1(m.x), 0, this.r1(m.z), this.r1(m.yaw), Math.round(m.hp), m.w, m.f, m.dead]);
+    });
+    const pk = this.pickups.map((p) => [p.id, this.r1(p.group.position.x), this.r1(p.group.position.z), p.kind]);
+    this.netSendFn(null, {
+      t: "snap", e, av,
+      bk: [this.r1(this.basilisk.position.z), Math.round(this.basiliskHp)],
+      wv: this.wave, pk,
+    });
+  }
+
+  private sendState() {
+    this.netSendFn?.(null, {
+      t: "s",
+      p: [this.r1(this.pos.x), this.r1(this.pos.y), this.r1(this.pos.z)],
+      yaw: Math.round(this.yaw * 100) / 100,
+      hp: Math.round(this.hp), w: this.weaponIdx, f: this.mouseDown, dead: this.guestDead,
+    });
+  }
+
+  /* ----- avatars ----- */
+
+  private ensureRemote(pid: string, name: string, color: number): RemotePlayer {
+    let rp = this.remotePlayers.get(pid);
+    if (rp) return rp;
+    const g = new THREE.Group();
+    const dark = new THREE.MeshStandardMaterial({ color: 0x1e1f2a, roughness: 0.7 });
+    const legs = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.85, 0.36), dark);
+    legs.position.y = 0.42; g.add(legs);
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.78, 0.95, 0.44), new THREE.MeshStandardMaterial({ color: 0x2b2d3d, roughness: 0.6 }));
+    torso.position.y = 1.32; torso.castShadow = true; g.add(torso);
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.38, 0.42), dark);
+    head.position.y = 2.02; g.add(head);
+    const accent = new THREE.MeshStandardMaterial({ color: 0x0a0a10, emissive: color, emissiveIntensity: 2.4 });
+    const visor = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.1, 0.06), accent);
+    visor.position.set(0, 2.04, 0.22); g.add(visor);
+    const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.12, 0.46), accent);
+    stripe.position.y = 1.6; g.add(stripe);
+    const gun = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.14, 0.9), dark);
+    gun.position.set(0.42, 1.35, 0.3); g.add(gun);
+    const muzzle = new THREE.PointLight(color, 0, 10);
+    muzzle.position.set(0.42, 1.4, 0.9);
+    g.add(muzzle);
+    const nc = document.createElement("canvas");
+    nc.width = 256; nc.height = 64;
+    const nctx = nc.getContext("2d")!;
+    nctx.font = "700 34px Rajdhani, sans-serif";
+    nctx.textAlign = "center"; nctx.textBaseline = "middle";
+    nctx.fillStyle = "#" + color.toString(16).padStart(6, "0");
+    nctx.shadowColor = nctx.fillStyle; nctx.shadowBlur = 14;
+    nctx.fillText(name, 128, 32);
+    const nt = new THREE.CanvasTexture(nc);
+    nt.colorSpace = THREE.SRGBColorSpace;
+    const ns = new THREE.Sprite(new THREE.SpriteMaterial({ map: nt, transparent: true, depthWrite: false }));
+    ns.scale.set(2.2, 0.55, 1);
+    ns.position.y = 2.75;
+    ns.raycast = () => undefined;
+    g.add(ns);
+    g.position.set(this.pos.x + 2, 0, this.pos.z - 2);
+    this.scene.add(g);
+    rp = { pid, name, group: g, accent, muzzle, tx: g.position.x, ty: 0, tz: g.position.z, trot: 0, dead: false };
+    this.remotePlayers.set(pid, rp);
+    return rp;
+  }
+
+  private updateRemotePlayers(raw: number) {
+    const k = Math.min(1, 14 * raw);
+    this.remotePlayers.forEach((rp) => {
+      rp.group.visible = !rp.dead;
+      rp.group.position.x += (rp.tx - rp.group.position.x) * k;
+      rp.group.position.z += (rp.tz - rp.group.position.z) * k;
+      let dr = rp.trot - rp.group.rotation.y;
+      while (dr > Math.PI) dr -= Math.PI * 2;
+      while (dr < -Math.PI) dr += Math.PI * 2;
+      rp.group.rotation.y += dr * k;
+      rp.muzzle.intensity = Math.max(0, rp.muzzle.intensity - raw * 22);
+    });
+    if (this.netMode === "host") {
+      const now = performance.now();
+      [...this.squad.values()].forEach((m) => {
+        if (now - m.last > 8000) this.netGuestLeft(m.pid);
+      });
+    }
+  }
+
+  /* ----- guest side ----- */
+
+  private makePickupGroup(kind: "med" | "chip"): THREE.Group {
+    const g = new THREE.Group();
+    if (kind === "med") {
+      g.add(new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.35, 0.55), new THREE.MeshStandardMaterial({ color: 0x10241a, emissive: 0x39ff9d, emissiveIntensity: 1.4 })));
+      const c1 = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.08, 0.06), new THREE.MeshStandardMaterial({ color: 0x052e18, emissive: 0x39ff9d, emissiveIntensity: 2.6 }));
+      c1.position.z = 0.29; g.add(c1);
+      const c2 = c1.clone(); c2.rotation.z = Math.PI / 2; g.add(c2);
+    } else {
+      const chip = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.08, 6), new THREE.MeshStandardMaterial({ color: 0x201a05, emissive: 0xfcee0a, emissiveIntensity: 2.2, metalness: 0.8, roughness: 0.3 }));
+      chip.rotation.x = Math.PI / 2; g.add(chip);
+      g.add(new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.06, 0.16), new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0x00e5ff, emissiveIntensity: 3 })));
+    }
+    return g;
+  }
+
+  private applySnapshot(m: { e: (string | number)[][]; av: (string | number | boolean)[][]; bk: number[]; wv: number; pk: (string | number)[][] }) {
+    /* enemies */
+    const seen = new Set<number>();
+    for (const row of m.e) {
+      const id = row[0] as number;
+      const kind = row[1] as "drone" | "soldier" | "heavy";
+      const x = row[2] as number, y = row[3] as number, z = row[4] as number;
+      const rot = row[5] as number, hp = row[6] as number, max = row[7] as number, fuse = row[8] as number;
+      seen.add(id);
+      this.netTargets.set(id, { x, z, rot, hp, max, fuse });
+      const ex = this.enemyById.get(id);
+      if (!ex) {
+        const e = this.spawnEnemy(kind, { id, x, z, hp, max });
+        e.root.position.set(x, kind === "drone" ? 2.6 : 0, z);
+        e.root.rotation.y = rot;
+      } else if (Math.abs(ex.hp - hp) > 0.5) {
+        ex.hp = hp; ex.maxHp = max;
+        this.drawBar(ex, hp / max);
+      }
+    }
+    for (const e of [...this.enemies]) {
+      if (!seen.has(e.eid)) { this.netTargets.delete(e.eid); this.removeEnemy(e, false); }
+    }
+    /* remote players */
+    let ci = 0;
+    this.avInfo.clear();
+    for (const a of m.av) {
+      const pid = a[0] as string;
+      if (pid === "G") continue;
+      const name = a[1] as string;
+      this.avInfo.set(pid, { name, hp: a[6] as number, dead: a[9] as boolean });
+      const rp = this.ensureRemote(pid, name, pid === "H" ? 0xfcee0a : AVATAR_COLORS[ci++ % AVATAR_COLORS.length]);
+      rp.tx = a[2] as number; rp.tz = a[4] as number; rp.trot = a[5] as number;
+      rp.dead = a[9] as boolean;
+      if (a[8]) rp.muzzle.intensity = 3.2;
+    }
+    /* basilisk */
+    this.netBkZ = m.bk[0];
+    this.netBkHp = m.bk[1];
+    this.wave = m.wv;
+    /* pickups */
+    const seenP = new Set<number>();
+    for (const p of m.pk) {
+      const id = p[0] as number;
+      seenP.add(id);
+      if (!this.netPk.has(id)) {
+        const g = this.makePickupGroup(p[3] as "med" | "chip");
+        g.position.set(p[1] as number, 0.8, p[2] as number);
+        this.scene.add(g);
+        this.netPk.set(id, { group: g, kind: p[3] as "med" | "chip", t: rnd(0, 9), id });
+      }
+    }
+    for (const [id, pk] of [...this.netPk]) {
+      if (!seenP.has(id)) { this.scene.remove(pk.group); this.netPk.delete(id); }
+    }
+  }
+
+  private updateGuestSim(raw: number) {
+    /* interpolate enemies */
+    const k = Math.min(1, 11 * raw);
+    for (const e of this.enemies) {
+      const t = this.netTargets.get(e.eid);
+      if (!t) continue;
+      e.root.position.x += (t.x - e.root.position.x) * k;
+      e.root.position.z += (t.z - e.root.position.z) * k;
+      let dr = t.rot - e.root.rotation.y;
+      while (dr > Math.PI) dr -= Math.PI * 2;
+      while (dr < -Math.PI) dr += Math.PI * 2;
+      e.root.rotation.y += dr * k;
+      if (e.kind === "drone") {
+        e.bobT += raw * 3;
+        e.root.position.y = 2.6 + Math.sin(e.bobT) * 0.4;
+        if (e.rotors) e.rotors.rotation.y += raw * 22;
+      }
+      if (t.fuse > 0 && e.fuse < 0) e.fuse = 0.5;
+      if (e.fuse > 0) {
+        const blink = Math.sin(performance.now() * 0.03) > 0;
+        e.mats.forEach((mm) => { mm.emissiveIntensity = blink ? 4 : 0.6; });
+      }
+    }
+    /* basilisk */
+    this.basilisk.position.z += (this.netBkZ - this.basilisk.position.z) * Math.min(1, 4 * raw);
+    this.basiliskHp = this.netBkHp;
+    const tt = performance.now() * 0.001;
+    this.coreLight.intensity = 2.2 + Math.sin(tt * 3.4) * 0.7;
+    if (this.netBkHp <= 0 && !this.basiliskDead) { this.basiliskDead = true; this.basilisk.visible = false; }
+    /* pickups */
+    for (const [id, pk] of [...this.netPk]) {
+      pk.t += raw;
+      pk.group.rotation.y += raw * 2.4;
+      pk.group.position.y = 0.8 + Math.sin(pk.t * 2.4) * 0.18;
+      if (!this.guestDead && pk.group.position.distanceTo(this.pos) < 1.6) {
+        if (pk.kind === "med") { this.heal(35); this.sfx.pickup(); } else this.applyChip();
+        this.scene.remove(pk.group);
+        this.netPk.delete(id);
+        this.netSendFn?.(null, { t: "pick", id });
+      }
+    }
+    /* respawn flow */
+    if (this.guestDead) {
+      this.respawnWait -= raw;
+      if (this.respawnWait <= 0 && !this.reqSent) {
+        this.reqSent = true;
+        this.netSendFn?.(null, { t: "rreq" });
+      }
+    }
+  }
+
+  /* ----- message router ----- */
+
+  netReceive(from: string, m: { t: string; [k: string]: unknown }) {
+    if (!m || typeof m.t !== "string") return;
+    if (this.netMode === "host") {
+      switch (m.t) {
+        case "s": this.hostGuestState(from, m as unknown as { p: number[]; yaw: number; hp: number; w: number; f: boolean }); break;
+        case "shot": this.hostGuestShot(from, m as unknown as { o: number[]; d: number[]; w: number; mult: number; crit: number }); break;
+        case "dash": this.hostGuestDash(from, m as unknown as { p: number[]; mdmg: number }); break;
+        case "pick": this.hostPick(from, m.id as number); break;
+        case "rreq": {
+          const s = this.squad.get(from);
+          if (s && s.dead) this.netSendFn?.(from, { t: "respawn", p: [this.r1(this.basilisk.position.x + rnd(-3, 3)), 0, this.r1(this.basilisk.position.z - rnd(3, 7))] });
+          break;
+        }
+        default: break;
+      }
+      return;
+    }
+    if (this.netMode !== "guest") return;
+    switch (m.t) {
+      case "welcome": this.guestName = (m.name as string) ?? "ПАНАМ"; break;
+      case "snap": this.applySnapshot(m as never); break;
+      case "xp": this.addXp(m.v as number, new THREE.Vector3(...(m.at as number[]))); if (this.leech > 0) this.heal(this.leech); break;
+      case "dmg": if (!this.guestDead) this.damagePlayer(m.v as number); break;
+      case "heal": this.heal(m.v as number); break;
+      case "bolt": this.fireBolt(new THREE.Vector3(...(m.o as number[])), new THREE.Vector3(...(m.a as number[])), 0, 26, m.c as number, true); break;
+      case "boom": {
+        const at = new THREE.Vector3(...(m.at as number[]));
+        this.spawnExplosion(at, (m.big ? 26 : 14), m.c as number);
+        this.sfx.explode(!!m.big);
+        break;
+      }
+      case "float": this.emitFloat(new THREE.Vector3(...(m.at as number[])), m.txt as string, !!m.crit, !!m.heal); break;
+      case "wave": this.wave = m.n as number; this.cb.onEvent({ t: "banner", text: `ВОЛНА ${m.n}`, sub: "Корпоративное преследование" }); this.sfx.wave(); break;
+      case "radio": this.cb.onEvent({ t: "toast", text: m.txt as string, tone: "panam" }); break;
+      case "toast": this.cb.onEvent({ t: "toast", text: m.txt as string, tone: m.tone as "panam" | "sys" | "chip" | "warn" }); break;
+      case "banner": this.cb.onEvent({ t: "banner", text: m.txt as string, sub: m.sub as string | undefined }); break;
+      case "pick": {
+        const pk = this.netPk.get(m.id as number);
+        if (pk) { this.scene.remove(pk.group); this.netPk.delete(m.id as number); }
+        break;
+      }
+      case "die":
+        this.guestDead = true;
+        this.respawnWait = 5;
+        this.reqSent = false;
+        this.mouseDown = false;
+        this.cb.onEvent({ t: "toast", text: "ТЫ ПАЛА // ВОЗРОЖДЕНИЕ ЧЕРЕЗ 5 СЕК", tone: "warn" });
+        break;
+      case "respawn": {
+        const p = m.p as number[];
+        this.pos.set(p[0], 0, p[2]);
+        this.vel.set(0, 0, 0);
+        this.hp = this.maxHp;
+        this.guestDead = false;
+        this.invulnT = 2;
+        this.cb.onEvent({ t: "toast", text: "ВОЗРОЖДЕНИЕ // НЕЙРОЛИНК ПЕРЕЗАПУЩЕН", tone: "sys" });
+        break;
+      }
+      case "end": this.endRun(m.kind as "dead" | "won", (m.reason as string) ?? ""); break;
+      default: break;
+    }
+  }
 
   dispose() {
     this.disposed = true;
@@ -741,11 +1178,12 @@ export class GameEngine {
   };
   private onPlChange = () => {
     const locked = document.pointerLockElement === this.canvas;
-    if (!locked && this.mode === "play" && !this.ended && !this.awaitPerk && !this.paused) {
+    if (!locked && this.mode === "play" && !this.ended && !this.awaitPerk && !this.paused && !this.netMode) {
       this.paused = true;
       this.mouseDown = false;
       this.cb.onEvent({ t: "pause" });
     }
+    if (!locked) this.mouseDown = false;
   };
 
   /* ---------------- actions ---------------- */
@@ -771,6 +1209,13 @@ export class GameEngine {
     this.invulnT = Math.max(this.invulnT, 0.35);
     this.sfx.dash();
     this.spawnSparks(this.pos.clone().add(new THREE.Vector3(0, 1, 0)), 0x00e5ff, 10, 4);
+    if (this.netMode === "guest") {
+      this.netSendFn?.(null, {
+        t: "dash",
+        p: [this.r1(this.pos.x), this.r1(this.pos.y), this.r1(this.pos.z)],
+        mdmg: this.mantis ? 90 * this.dmgMult : 0,
+      });
+    }
     if (this.mantis) {
       const fwd = new THREE.Vector3(Math.sin(this.yaw), 0, Math.cos(this.yaw)).negate();
       [...this.enemies].forEach((e) => {
@@ -800,7 +1245,8 @@ export class GameEngine {
   }
 
   private tryFire() {
-    if (this.reloading || this.fireCd > 0 || this.ended || this.paused || this.awaitPerk) return;
+    if (this.reloading || this.fireCd > 0 || this.ended || this.paused || this.guestDead) return;
+    if (this.awaitPerk && !this.netMode) return;
     const w = WEAPONS[this.weaponIdx];
     if (this.mags[this.weaponIdx] <= 0) { this.startReload(); return; }
     this.mags[this.weaponIdx]--;
@@ -825,14 +1271,20 @@ export class GameEngine {
         const eid = (h.object.userData.eid as number) ?? -1;
         const en = this.enemyById.get(eid);
         if (en && !en.dead) {
-          let dmg = w.dmg * this.dmgMult * (this.sandeT > 0 ? 1.5 : 1);
-          const falloff = w.kind === "shotgun" ? clamp(1.4 - h.distance / 42, 0.35, 1.15) : clamp(1.25 - h.distance / 110, 0.55, 1.1);
-          dmg *= falloff;
-          const crit = Math.random() < this.critCh;
-          if (crit) dmg *= this.critMult;
-          this.hitsC++;
-          this.dmgDealt += dmg;
-          this.damageEnemy(en, dmg, h.point, crit);
+          this.spawnSparks(h.point, 0xffb35a, 2, 3);
+          if (this.netMode !== "guest") {
+            let dmg = w.dmg * this.dmgMult * (this.sandeT > 0 ? 1.5 : 1);
+            const falloff = w.kind === "shotgun" ? clamp(1.4 - h.distance / 42, 0.35, 1.15) : clamp(1.25 - h.distance / 110, 0.55, 1.1);
+            dmg *= falloff;
+            const crit = Math.random() < this.critCh;
+            if (crit) dmg *= this.critMult;
+            this.hitsC++;
+            this.dmgDealt += dmg;
+            this.damageEnemy(en, dmg, h.point, crit);
+          } else {
+            this.hitsC++;
+            this.sfx.hit();
+          }
         }
       } else {
         end = from.clone().add(dir.clone().multiplyScalar(110));
@@ -840,15 +1292,20 @@ export class GameEngine {
       }
       this.spawnTracer(from, end);
     }
+    if (this.netMode === "guest") {
+      this.netSendFn?.(null, {
+        t: "shot",
+        o: [this.r1(from.x), this.r1(from.y), this.r1(from.z)],
+        d: [this.r1(camDir.x), this.r1(camDir.y), this.r1(camDir.z)],
+        w: this.weaponIdx, mult: this.dmgMult * (this.sandeT > 0 ? 1.5 : 1), crit: this.critCh,
+      });
+    }
   }
 
   /* ---------------- combat ---------------- */
 
-  private damageEnemy(e: Enemy, dmg: number, point: THREE.Vector3, crit: boolean) {
-    if (e.dead) return;
-    e.hp -= dmg;
-    e.flash = 0.1;
-    const frac = clamp(e.hp / e.maxHp, 0, 1);
+  private drawBar(e: Enemy, fracRaw: number, crit = false) {
+    const frac = clamp(fracRaw, 0, 1);
     const ctx = e.barCtx;
     ctx.clearRect(0, 0, 96, 12);
     ctx.fillStyle = "rgba(5,3,12,0.75)";
@@ -856,22 +1313,36 @@ export class GameEngine {
     ctx.fillStyle = crit ? "#fcee0a" : frac > 0.5 ? "#39ff9d" : frac > 0.25 ? "#ff9a3d" : "#ff3b4e";
     ctx.fillRect(2, 2, 92 * frac, 8);
     e.barTex.needsUpdate = true;
+  }
+
+  private damageEnemy(e: Enemy, dmg: number, point: THREE.Vector3, crit: boolean, byPid: string | null = null) {
+    if (e.dead) return;
+    e.hp -= dmg;
+    e.flash = 0.1;
+    this.drawBar(e, e.hp / e.maxHp, crit);
     this.spawnSparks(point, e.kind === "drone" ? 0xff2d78 : 0xffb35a, 4, 5);
     this.emitFloat(point, `${Math.round(dmg)}`, crit);
     if (crit) this.sfx.crit(); else this.sfx.hit();
-    if (e.hp <= 0) this.killEnemy(e, true);
+    if (e.hp <= 0) this.killEnemy(e, true, byPid);
   }
 
-  private killEnemy(e: Enemy, grantXp: boolean) {
+  private killEnemy(e: Enemy, grantXp: boolean, byPid: string | null = null) {
     if (e.dead) return;
     e.dead = true;
     this.kills++;
     const def = ENEMY_DEFS[e.kind];
     const p = e.root.position.clone(); p.y += 1.2;
-    this.spawnExplosion(p, e.kind === "heavy" ? 26 : 14, e.kind === "drone" ? 0xff2d78 : e.kind === "heavy" ? 0xff9a3d : 0xffb35a);
+    const color = e.kind === "drone" ? 0xff2d78 : e.kind === "heavy" ? 0xff9a3d : 0xffb35a;
+    this.spawnExplosion(p, e.kind === "heavy" ? 26 : 14, color);
     this.sfx.explode(e.kind !== "soldier");
-    if (grantXp) this.addXp(def.xp, p);
-    if (this.leech > 0) this.heal(this.leech);
+    if (this.netMode === "host" && this.netSendFn) {
+      this.netSendFn(null, { t: "boom", at: [this.r1(p.x), this.r1(p.y), this.r1(p.z)], c: color, big: e.kind !== "soldier" });
+    }
+    if (grantXp) {
+      if (byPid && this.netSendFn) this.netSendFn(byPid, { t: "xp", v: def.xp, at: [this.r1(p.x), this.r1(p.y + 0.8), this.r1(p.z)] });
+      else this.addXp(def.xp, p);
+    }
+    if (this.leech > 0 && !byPid) this.heal(this.leech);
     if (e.kind === "heavy") this.spawnPickup("chip", p);
     else if (Math.random() < (e.kind === "soldier" ? 0.2 : 0.08)) this.spawnPickup("med", p);
     if (this.ice && Math.random() < 0.25) {
@@ -897,7 +1368,7 @@ export class GameEngine {
     });
   }
 
-  private fireBolt(from: THREE.Vector3, to: THREE.Vector3, dmg: number, speed: number, color: number) {
+  private fireBolt(from: THREE.Vector3, to: THREE.Vector3, dmg: number, speed: number, color: number, visual = false, pid: string | null = null) {
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(0.11, 6, 6),
       new THREE.MeshBasicMaterial({ color })
@@ -905,14 +1376,23 @@ export class GameEngine {
     mesh.position.copy(from);
     const vel = to.clone().sub(from).normalize().multiplyScalar(speed);
     this.scene.add(mesh);
-    this.bolts.push({ mesh, vel, dmg, life: 3.2 });
+    this.bolts.push({ mesh, vel, dmg, life: 3.2, visual, pid });
   }
 
   private explodeAtPlayer(p: THREE.Vector3, radius: number, dmg: number) {
     this.spawnExplosion(p.clone(), 18, 0xff2d78);
     this.sfx.explode(false);
+    if (this.netMode === "host" && this.netSendFn) {
+      this.netSendFn(null, { t: "boom", at: [this.r1(p.x), this.r1(p.y), this.r1(p.z)], c: 0xff2d78, big: false });
+    }
     const dP = p.distanceTo(this.pos.clone().add(new THREE.Vector3(0, 1, 0)));
     if (dP < radius) this.damagePlayer(dmg * (1 - dP / radius) + 6);
+    this.squad.forEach((_m, pid) => {
+      const m = this.squad.get(pid)!;
+      if (m.dead) return;
+      const dG = p.distanceTo(new THREE.Vector3(m.x, m.y + 1, m.z));
+      if (dG < radius) this.netSendFn?.(pid, { t: "dmg", v: dmg * (1 - dG / radius) + 6 });
+    });
     const dB = p.distanceTo(this.basilisk.position.clone().add(new THREE.Vector3(0, 2, 0)));
     if (dB < radius + 3 && !this.basiliskDead) {
       this.basiliskHp -= dmg * 1.6;
@@ -934,7 +1414,7 @@ export class GameEngine {
     if (this.pendingLevels > 0 && !this.awaitPerk) {
       this.awaitPerk = true;
       this.mouseDown = false;
-      if (document.pointerLockElement === this.canvas) document.exitPointerLock();
+      if (document.pointerLockElement === this.canvas && !this.netMode) document.exitPointerLock();
       const opts = this.pickPerkOptions();
       if (opts.length) {
         this.sfx.levelup();
@@ -971,7 +1451,15 @@ export class GameEngine {
     this.cb.onEvent({ t: "hurt" });
     if (this.hp <= 0) {
       this.hp = 0;
-      this.endRun("dead", "Ви пала в пустошах");
+      if (this.netMode === "guest") {
+        this.guestDead = true;
+        this.respawnWait = 5;
+        this.reqSent = false;
+        this.mouseDown = false;
+        this.cb.onEvent({ t: "toast", text: "ТЫ ПАЛА // ВОЗРОЖДЕНИЕ ЧЕРЕЗ 5 СЕК", tone: "warn" });
+      } else {
+        this.endRun("dead", "Ви пала в пустошах");
+      }
     }
   }
 
@@ -991,9 +1479,10 @@ export class GameEngine {
   /* ---------------- spawning ---------------- */
 
   private spawnWave(n: number) {
-    const drones = Math.min(3 + Math.floor(n * 1.15), 14);
-    const soldiers = Math.min(1 + Math.ceil(n * 0.85), 10);
-    const heavies = n >= 3 ? Math.ceil(n / 3) : 0;
+    const mult = 1 + 0.5 * this.squad.size;
+    const drones = Math.min(Math.round((3 + Math.floor(n * 1.15)) * mult), 16);
+    const soldiers = Math.min(Math.round((1 + Math.ceil(n * 0.85)) * mult), 12);
+    const heavies = n >= 3 ? Math.ceil((n / 3) * mult) : 0;
     let i = 0;
     const push = (kind: "drone" | "soldier" | "heavy", count: number) => {
       for (let k = 0; k < count; k++) this.spawnQueue.push({ kind, t: i++ * 0.5 });
@@ -1001,21 +1490,29 @@ export class GameEngine {
     push("soldier", soldiers);
     push("drone", drones);
     push("heavy", heavies);
-    this.cb.onEvent({ t: "banner", text: `ВОЛНА ${n}`, sub: n % 3 === 0 ? "Обнаружен тяжёлый юнит" : "Корпоративное преследование" });
+    this.netBanner(`ВОЛНА ${n}`, n % 3 === 0 ? "Обнаружен тяжёлый юнит" : "Корпоративное преследование");
     this.sfx.wave();
-    if (Math.random() < 0.5) this.cb.onEvent({ t: "toast", text: WAVE_QUIPS[Math.floor(Math.random() * WAVE_QUIPS.length)], tone: "panam" });
-    if (n === 2 && !this.unlockedW[1]) { this.unlockedW[1] = true; this.cb.onEvent({ t: "toast", text: "Оружие разблокировано: HJKE «ХИКЭЦУ» [2]", tone: "sys" }); }
-    if (n === 4 && !this.unlockedW[2]) { this.unlockedW[2] = true; this.cb.onEvent({ t: "toast", text: "Оружие разблокировано: «ИГЛА» [3]", tone: "sys" }); }
+    if (this.netMode === "host" && this.netSendFn) this.netSendFn(null, { t: "wave", n });
+    if (Math.random() < 0.5) this.netToast(WAVE_QUIPS[Math.floor(Math.random() * WAVE_QUIPS.length)], "panam");
+    if (n === 2 && !this.unlockedW[1]) { this.unlockedW[1] = true; this.netToast("Оружие разблокировано: HJKE «ХИКЭЦУ» [2]", "sys"); }
+    if (n === 4 && !this.unlockedW[2]) { this.unlockedW[2] = true; this.netToast("Оружие разблокировано: «ИГЛА» [3]", "sys"); }
   }
 
-  private spawnEnemy(kind: "drone" | "soldier" | "heavy") {
-    if (this.enemies.length > 24) return;
+  private spawnEnemy(kind: "drone" | "soldier" | "heavy", net?: { id: number; x: number; z: number; hp: number; max: number }): Enemy {
+    if (this.enemies.length > 26) {
+      if (net) { /* still create synced enemies */ }
+      else return this.enemies[0];
+    }
     const def = ENEMY_DEFS[kind];
     const waveScale = 1 + (this.wave - 1) * 0.16;
-    const behind = Math.random() < 0.6;
-    const z = clamp(this.basilisk.position.z + (behind ? -rnd(30, 80) : rnd(55, 125)), -40, TRAVEL + 140);
-    const x = (Math.random() < 0.5 ? -1 : 1) * rnd(16, CORRIDOR + 12);
-    const eid = EID++;
+    let x: number, z: number;
+    if (net) { x = net.x; z = net.z; }
+    else {
+      const behind = Math.random() < 0.6;
+      z = clamp(this.basilisk.position.z + (behind ? -rnd(30, 80) : rnd(55, 125)), -40, TRAVEL + 140);
+      x = (Math.random() < 0.5 ? -1 : 1) * rnd(16, CORRIDOR + 12);
+    }
+    const eid = net ? net.id : EID++;
     const root = new THREE.Group();
     root.position.set(x, 0, z);
     root.userData.eid = eid;
@@ -1097,7 +1594,7 @@ export class GameEngine {
 
     const e: Enemy = {
       eid, root, kind,
-      hp: def.hp * waveScale, maxHp: def.hp * waveScale,
+      hp: net ? net.hp : def.hp * waveScale, maxHp: net ? net.max : def.hp * waveScale,
       speed: def.speed * (1 + (this.wave - 1) * 0.03),
       fireT: rnd(0.6, 1.6), meleeT: 0,
       orbitA: rnd(0, Math.PI * 2), strafe: Math.random() < 0.5 ? -1 : 1,
@@ -1108,6 +1605,7 @@ export class GameEngine {
     this.enemyById.set(eid, e);
     this.enemyRoots.push(root);
     this.scene.add(root);
+    return e;
   }
 
   private spawnPickup(kind: "med" | "chip", p: THREE.Vector3) {
@@ -1131,7 +1629,7 @@ export class GameEngine {
     g.position.copy(p);
     g.position.y = 0.8;
     this.scene.add(g);
-    this.pickups.push({ group: g, kind, t: rnd(0, 9) });
+    this.pickups.push({ group: g, kind, t: rnd(0, 9), id: PICKUP_ID++ });
   }
 
   /* ---------------- fx ---------------- */
@@ -1207,6 +1705,7 @@ export class GameEngine {
     this.ended = kind;
     this.mouseDown = false;
     this.sfx.stopMusic();
+    if (this.netMode === "host" && this.netSendFn) this.netSendFn(null, { t: "end", kind, reason });
     if (kind === "dead") { this.sfx.lose(); this.cb.onEvent({ t: "death", stats: this.stats(), reason }); }
     else { this.sfx.win(); this.cb.onEvent({ t: "victory", stats: this.stats() }); }
     if (document.pointerLockElement === this.canvas) document.exitPointerLock();
@@ -1215,6 +1714,7 @@ export class GameEngine {
   /* ---------------- update ---------------- */
 
   private updatePlayer(dt: number) {
+    if (this.guestDead) { this.vel.set(0, 0, 0); return; }
     const f = this.tmpV.set(Math.sin(this.yaw), 0, Math.cos(this.yaw));
     const r = this.tmpV2.set(f.z, 0, -f.x);
     const wish = new THREE.Vector3();
@@ -1231,7 +1731,7 @@ export class GameEngine {
     this.vel.y -= 24 * dt;
     this.pos.addScaledVector(this.vel, dt);
     if (this.pos.y <= 0) { this.pos.y = 0; this.vel.y = 0; this.onGround = true; }
-    const bz = this.basilisk.position.z;
+    const bz = this.netMode === "guest" ? this.netBkZ : this.basilisk.position.z;
     this.pos.x = clamp(this.pos.x, -CORRIDOR - 6, CORRIDOR + 6);
     this.pos.z = clamp(this.pos.z, bz - 75, bz + 130);
     this.pos.z = Math.max(-30, this.pos.z);
@@ -1303,7 +1803,7 @@ export class GameEngine {
     this.coreMat.emissiveIntensity = 2.4 + Math.sin(t * 3.4) * 0.8;
     const progress = clamp(this.basilisk.position.z / TRAVEL, 0, 1);
     while (this.radioIdx < RADIO_LINES.length && progress >= RADIO_LINES[this.radioIdx].at) {
-      this.cb.onEvent({ t: "toast", text: RADIO_LINES[this.radioIdx].text, tone: "panam" });
+      this.netToast(RADIO_LINES[this.radioIdx].text, "panam");
       this.radioIdx++;
     }
     if (this.basiliskHp <= 0) {
@@ -1317,7 +1817,7 @@ export class GameEngine {
     }
     if (progress >= 1 && !this.ended && this.victoryT < 0) {
       this.victoryT = 1.6;
-      this.cb.onEvent({ t: "banner", text: "ТОЧКА ЭВАКУАЦИИ", sub: "Гипердвигатель заряжен" });
+      this.netBanner("ТОЧКА ЭВАКУАЦИИ", "Гипердвигатель заряжен");
     }
   }
 
@@ -1338,8 +1838,10 @@ export class GameEngine {
       const targetBasilisk = dB < dP && !this.basiliskDead;
 
       if (e.kind === "soldier") {
-        const target = targetBasilisk ? basiliskC : playerEye;
-        const d = targetBasilisk ? dB : dP;
+        const np = this.nearestPlayer(ep);
+        const target = targetBasilisk ? basiliskC : np.pos;
+        const d = targetBasilisk ? dB : np.d;
+        const aimEye = np.pid ? new THREE.Vector3(np.pos.x, np.pos.y + 1.4, np.pos.z) : playerEye;
         const dir = this.tmpV2.clone().copy(target).sub(ep).setY(0);
         if (dir.lengthSq() > 0.01) {
           dir.normalize();
@@ -1350,18 +1852,29 @@ export class GameEngine {
           e.root.rotation.y = Math.atan2(dir.x, dir.z);
         }
         e.meleeT -= dt;
-        if (dP < 2.1 && e.meleeT <= 0) { this.damagePlayer(12); e.meleeT = 1; }
+        if (!targetBasilisk && np.d < 2.1 && e.meleeT <= 0) {
+          if (np.pid) this.netSendFn?.(np.pid, { t: "dmg", v: 12 });
+          else this.damagePlayer(12);
+          e.meleeT = 1;
+        }
         e.fireT -= dt;
-        if (e.fireT <= 0 && dP < 65) {
+        if (e.fireT <= 0 && np.d < 65) {
           const from = ep.clone().add(new THREE.Vector3(0.42, 1.5, 0));
-          const to = playerEye.clone().add(new THREE.Vector3(rnd(-1, 1), rnd(-0.6, 1), rnd(-1, 1)).multiplyScalar(0.5 + dP * 0.02));
-          this.fireBolt(from, to, ENEMY_DEFS.soldier.dmg * (1 + (this.wave - 1) * 0.12), 26, 0xff5060);
+          const to = aimEye.clone().add(new THREE.Vector3(rnd(-1, 1), rnd(-0.6, 1), rnd(-1, 1)).multiplyScalar(0.5 + np.d * 0.02));
+          const dmgS = ENEMY_DEFS.soldier.dmg * (1 + (this.wave - 1) * 0.12);
+          if (np.pid) {
+            this.fireBolt(from, to, dmgS, 26, 0xff5060, false, np.pid);
+            this.netSendFn?.(np.pid, { t: "bolt", o: [this.r1(from.x), this.r1(from.y), this.r1(from.z)], a: [this.r1(to.x), this.r1(to.y), this.r1(to.z)], c: 0xff5060 });
+          } else {
+            this.fireBolt(from, to, dmgS, 26, 0xff5060);
+          }
           e.fireT = rnd(1.2, 2.1);
         }
       } else if (e.kind === "drone") {
         if (e.rotors) e.rotors.rotation.y += dt * 22;
         if (e.fuse < 0) {
-          const target = dP < 40 || this.basiliskDead ? this.pos : this.basilisk.position;
+          const np = this.nearestPlayer(ep);
+          const target = np.d < 40 || this.basiliskDead ? np.pos : this.basilisk.position;
           e.orbitA += dt * 1.15;
           const R = 8;
           const desired = new THREE.Vector3(
@@ -1372,7 +1885,7 @@ export class GameEngine {
           const toDes = desired.sub(ep);
           const dist = toDes.length();
           if (dist > 0.1) ep.addScaledVector(toDes.normalize(), Math.min(e.speed * 1.35 * dt, dist));
-          const nearP = dP < 3.4;
+          const nearP = np.d < 3.4;
           const nearB = !this.basiliskDead && ep.distanceTo(this.basilisk.position.clone().add(new THREE.Vector3(0, 2.5, 0))) < 4.5;
           if (nearP || nearB) { e.fuse = 0.55; this.sfx.ui(); }
         } else {
@@ -1386,8 +1899,10 @@ export class GameEngine {
           }
         }
       } else {
-        const target = targetBasilisk ? basiliskC : playerEye;
-        const d = targetBasilisk ? dB : dP;
+        const np = this.nearestPlayer(ep);
+        const target = targetBasilisk ? basiliskC : np.pos;
+        const d = targetBasilisk ? dB : np.d;
+        const aimEye = np.pid ? new THREE.Vector3(np.pos.x, np.pos.y + 1.4, np.pos.z) : playerEye;
         const dir = target.clone().sub(ep).setY(0);
         if (dir.lengthSq() > 0.01) {
           dir.normalize();
@@ -1401,16 +1916,26 @@ export class GameEngine {
             e.burst--;
             e.burstT = 0.13;
             const from = ep.clone().add(new THREE.Vector3(rnd(-1, 1) * 0.9, 2.75, 0.6));
-            const to = playerEye.clone().add(new THREE.Vector3(rnd(-1, 1), rnd(-0.5, 0.8), rnd(-1, 1)).multiplyScalar(0.7 + dP * 0.015));
-            this.fireBolt(from, to, ENEMY_DEFS.heavy.dmg * (1 + (this.wave - 1) * 0.1), 30, 0xffa040);
+            const to = aimEye.clone().add(new THREE.Vector3(rnd(-1, 1), rnd(-0.5, 0.8), rnd(-1, 1)).multiplyScalar(0.7 + np.d * 0.015));
+            const dmgH = ENEMY_DEFS.heavy.dmg * (1 + (this.wave - 1) * 0.1);
+            if (np.pid) {
+              this.fireBolt(from, to, dmgH, 30, 0xffa040, false, np.pid);
+              this.netSendFn?.(np.pid, { t: "bolt", o: [this.r1(from.x), this.r1(from.y), this.r1(from.z)], a: [this.r1(to.x), this.r1(to.y), this.r1(to.z)], c: 0xffa040 });
+            } else {
+              this.fireBolt(from, to, dmgH, 30, 0xffa040);
+            }
           }
-        } else if (e.fireT <= 0 && dP < 75) {
+        } else if (e.fireT <= 0 && np.d < 75) {
           e.burst = 3;
           e.burstT = 0;
           e.fireT = rnd(2.0, 2.7);
         }
         e.meleeT -= dt;
-        if (dP < 2.6 && e.meleeT <= 0) { this.damagePlayer(22); e.meleeT = 1.2; }
+        if (!targetBasilisk && np.d < 2.6 && e.meleeT <= 0) {
+          if (np.pid) this.netSendFn?.(np.pid, { t: "dmg", v: 22 });
+          else this.damagePlayer(22);
+          e.meleeT = 1.2;
+        }
       }
       /* bob + altitude for drone root */
       if (e.kind !== "drone") ep.y = 0;
@@ -1425,9 +1950,20 @@ export class GameEngine {
       b.mesh.position.addScaledVector(b.vel, dt);
       const p = b.mesh.position;
       if (b.life <= 0 || p.y < 0.05) {
-        if (p.y < 0.3) this.spawnSparks(p.clone(), 0x8a6a50, 3, 3);
+        if (p.y < 0.3 && !b.visual) this.spawnSparks(p.clone(), 0x8a6a50, 3, 3);
         this.scene.remove(b.mesh);
         this.bolts = this.bolts.filter((x) => x !== b);
+        continue;
+      }
+      if (b.visual) continue;
+      if (b.pid) {
+        const s = this.squad.get(b.pid);
+        if (s && !s.dead && p.distanceTo(this.tmpV.set(s.x, s.y + 1.2, s.z)) < 1.0) {
+          this.netSendFn?.(b.pid, { t: "dmg", v: b.dmg });
+          this.spawnSparks(p.clone(), 0xff5060, 5, 4);
+          this.scene.remove(b.mesh);
+          this.bolts = this.bolts.filter((x) => x !== b);
+        }
         continue;
       }
       if (p.distanceTo(this.tmpV.set(this.pos.x, this.pos.y + 1.2, this.pos.z)) < 1.0) {
@@ -1475,6 +2011,7 @@ export class GameEngine {
   }
 
   private updatePickups(dt: number) {
+    if (this.netMode === "guest") return;
     for (const p of [...this.pickups]) {
       p.t += dt;
       p.group.rotation.y += dt * 2.4;
@@ -1489,6 +2026,7 @@ export class GameEngine {
   }
 
   private updateWaves(raw: number) {
+    if (this.netMode === "guest") return;
     for (const q of [...this.spawnQueue]) {
       q.t -= raw;
       if (q.t <= 0) {
@@ -1543,6 +2081,15 @@ export class GameEngine {
     for (const p of this.pickups) {
       radar.push({ x: (p.group.position.x - this.pos.x) / 1.3, z: (p.group.position.z - this.pos.z) / 1.3, k: p.kind });
     }
+    if (this.netMode === "host") {
+      this.squad.forEach((m) => {
+        if (!m.dead) radar.push({ x: (m.x - this.pos.x) / 1.3, z: (m.z - this.pos.z) / 1.3, k: "ally" });
+      });
+    } else if (this.netMode === "guest") {
+      this.remotePlayers.forEach((rp) => {
+        if (!rp.dead) radar.push({ x: (rp.group.position.x - this.pos.x) / 1.3, z: (rp.group.position.z - this.pos.z) / 1.3, k: "ally" });
+      });
+    }
     radar.push({ x: -this.pos.x / 1.3, z: (TRAVEL - this.pos.z) / 1.3, k: "beacon" });
     radar.push({ x: (this.basilisk.position.x - this.pos.x) / 1.3, z: (this.basilisk.position.z - this.pos.z) / 1.3, k: "basilisk" });
 
@@ -1572,6 +2119,31 @@ export class GameEngine {
       implants,
       yaw: this.yaw,
       radar,
+      net: {
+        role: this.netMode,
+        ping: this.netPing,
+        room: this.roomCode,
+        gdead: this.guestDead,
+        respawnIn: Math.max(0, Math.ceil(this.respawnWait)),
+        squad: (() => {
+          const list: HudData["net"]["squad"] = [];
+          if (this.netMode === "host") {
+            list.push({ name: "ВИ", hp: Math.round(this.hp), maxHp: this.maxHp, me: true, dead: this.ended === "dead" });
+            this.squad.forEach((m) => list.push({ name: m.name, hp: Math.max(0, Math.round(m.hp)), maxHp: m.maxHp, me: false, dead: m.dead }));
+          } else if (this.netMode === "guest") {
+            list.push({ name: this.guestName, hp: Math.round(this.hp), maxHp: this.maxHp, me: true, dead: this.guestDead });
+            this.avInfo.forEach((v, pid) => {
+              if (pid !== "H") return;
+              list.push({ name: "ВИ", hp: Math.max(0, v.hp), maxHp: 100, me: false, dead: v.dead });
+            });
+            this.avInfo.forEach((v, pid) => {
+              if (pid === "H") return;
+              list.push({ name: v.name, hp: Math.max(0, v.hp), maxHp: 100, me: false, dead: v.dead });
+            });
+          }
+          return list;
+        })(),
+      },
     });
   }
 
@@ -1594,19 +2166,32 @@ export class GameEngine {
     }
     this.viewmodel.visible = true;
 
-    if (!this.paused && !this.awaitPerk && !this.ended) {
+    if (!this.paused && !this.ended && (!this.awaitPerk || !!this.netMode)) {
       this.timeScale += ((this.sandeT > 0 ? 0.32 : 1) - this.timeScale) * Math.min(1, raw * 7);
       const dt = raw * this.timeScale;
       this.runT += raw;
       this.updatePlayer(raw);
-      this.updateBasilisk(dt);
-      this.updateEnemies(dt);
+      if (this.netMode === "guest") {
+        this.updateGuestSim(raw);
+      } else {
+        this.updateBasilisk(dt);
+        this.updateEnemies(dt);
+        this.updateWaves(raw);
+        this.updatePickups(dt);
+        if (this.victoryT >= 0 && !this.ended) {
+          this.victoryT -= raw;
+          if (this.victoryT <= 0) this.endRun("won");
+        }
+      }
       this.updateBolts(dt);
-      this.updateWaves(raw);
-      this.updatePickups(dt);
-      if (this.victoryT >= 0 && !this.ended) {
-        this.victoryT -= raw;
-        if (this.victoryT <= 0) this.endRun("won");
+      this.updateRemotePlayers(raw);
+      if (this.netMode === "host") {
+        this.netTick += raw;
+        if (this.netTick >= 0.1) { this.netTick = 0; this.sendSnapshot(); }
+      }
+      if (this.netMode === "guest" && !this.guestDead) {
+        this.netStateTick += raw;
+        if (this.netStateTick >= 1 / 15) { this.netStateTick = 0; this.sendState(); }
       }
     }
     this.updateParticles(this.paused || this.awaitPerk ? 0 : raw * this.timeScale || raw * 0.016);
